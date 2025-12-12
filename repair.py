@@ -1,102 +1,194 @@
-
 import streamlit as st
 import pandas as pd
 import requests
 from datetime import datetime
-import time
-import base64
 import re
+import io
 
 # --- gspread / google auth ---
 import gspread
 from google.oauth2.service_account import Credentials
 
+# --- Google Drive API ---
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseUpload
+
+
+# =========================
+# Utils
+# =========================
 def norm_pwd(x) -> str:
     """密碼正規化：去除全/半形空白、換行、零寬字元"""
     if x is None:
         return ""
     s = str(x)
-    s = s.replace("\u3000", " ")          # 全形空白
+    s = s.replace("\u3000", " ")                 # 全形空白
     s = re.sub(r"[\u200b-\u200d\ufeff]", "", s)  # 零寬字元
-    s = s.strip()
-    return s
+    return s.strip()
 
-# --- 1. 全域變數與設定 ---
+
+def to_ymd(ts: str) -> str:
+    """把各種 timestamp 轉成 YYYY-MM-DD（失敗回空字串）"""
+    d = pd.to_datetime(ts, errors="coerce")
+    if pd.isna(d):
+        return ""
+    return d.strftime("%Y-%m-%d")
+
+
+def split_links(cell: str) -> list[str]:
+    if not cell:
+        return []
+    return [p.strip() for p in str(cell).split(",") if p.strip()]
+
+
+# =========================
+# Global settings
+# =========================
 LINE_ACCESS_TOKEN = st.secrets.get("LINE_ACCESS_TOKEN", "")
 GROUP_ID = st.secrets.get("GROUP_ID", "")
+
 SHEET_URL = st.secrets.get("SHEET_URL")
 if not SHEET_URL:
     st.error("找不到 SHEET_URL：請確認 Streamlit secrets 內有設定 SHEET_URL。")
     st.stop()
 
-
+DRIVE_FOLDER_ID = st.secrets.get("DRIVE_FOLDER_ID", "")  # 需在 Secrets 增加
 # 工作表名稱
 REPORT_SHEET = "報修資料"
 REPAIR_SHEET = "維修紀錄"
 PASSWORD_SHEET = "密碼設定"
 
 
+# =========================
+# LINE notify (optional)
+# =========================
 def line_notify(message: str) -> bool:
-    """LINE Notify 推播（若未設定 token 則略過）"""
     if not LINE_ACCESS_TOKEN:
         return False
     try:
         headers = {"Authorization": f"Bearer {LINE_ACCESS_TOKEN}"}
         payload = {"message": message}
-        r = requests.post("https://notify-api.line.me/api/notify", headers=headers, data=payload, timeout=10)
+        r = requests.post(
+            "https://notify-api.line.me/api/notify",
+            headers=headers,
+            data=payload,
+            timeout=10,
+        )
         return r.status_code == 200
     except Exception:
         return False
 
 
+# =========================
+# Google clients
+# =========================
+@st.cache_resource(ttl=None)
+def get_google_creds():
+    credentials_dict = dict(st.secrets["google_service_account"])
+    return Credentials.from_service_account_info(
+        credentials_dict,
+        scopes=[
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive",
+        ],
+    )
+
+
 @st.cache_resource(ttl=None)
 def get_gspread_client():
-    """使用 secrets.toml 的 [google_service_account] 連接 Google Sheets API（不使用 Base64）"""
     try:
-        credentials_dict = dict(st.secrets["google_service_account"])
-        creds = Credentials.from_service_account_info(
-            credentials_dict,
-            scopes=["https://www.googleapis.com/auth/spreadsheets"]
-        )
+        creds = get_google_creds()
         return gspread.authorize(creds)
     except Exception as e:
         st.error(f"Gspread 連線失敗：{e}")
         st.stop()
 
 
+@st.cache_resource(ttl=None)
+def get_drive_service():
+    try:
+        creds = get_google_creds()
+        return build("drive", "v3", credentials=creds)
+    except Exception as e:
+        st.error(f"Drive 連線失敗：{e}")
+        st.stop()
+
+
 gspread_client = get_gspread_client()
+drive_service = get_drive_service()
 
 
+def upload_to_drive(uploaded_file) -> str:
+    """
+    上傳 st.file_uploader 的 UploadedFile 到 Drive 資料夾
+    回傳 webViewLink（可點開）。多檔案用逗號分隔寫入 sheet。
+    """
+    if not DRIVE_FOLDER_ID:
+        st.error("未設定 DRIVE_FOLDER_ID：請到 Streamlit Secrets 新增 DRIVE_FOLDER_ID（上傳用資料夾ID）。")
+        st.stop()
+
+    file_bytes = uploaded_file.getvalue()
+    media = MediaIoBaseUpload(
+        io.BytesIO(file_bytes),
+        mimetype=uploaded_file.type or "application/octet-stream",
+        resumable=False,
+    )
+
+    body = {"name": uploaded_file.name, "parents": [DRIVE_FOLDER_ID]}
+
+    created = drive_service.files().create(
+        body=body,
+        media_body=media,
+        fields="id, webViewLink",
+        supportsAllDrives=True,
+    ).execute()
+
+    file_id = created["id"]
+
+    # 設定任何人可讀，否則通常無法直接顯示/開啟
+    drive_service.permissions().create(
+        fileId=file_id,
+        body={"type": "anyone", "role": "reader"},
+        supportsAllDrives=True,
+    ).execute()
+
+    return created.get("webViewLink", f"https://drive.google.com/file/d/{file_id}/view")
+
+
+# =========================
+# Data load / merge / write
+# =========================
 @st.cache_data(ttl=600)
 def load_data():
-    """使用 gspread 讀取資料（只抓指定欄位，避免空白表頭造成 duplicates）"""
+    """只抓指定欄位，避免空白表頭造成 duplicates"""
     try:
         spreadsheet = gspread_client.open_by_url(SHEET_URL)
 
         # --- 報修資料 ---
         report_sheet = spreadsheet.worksheet(REPORT_SHEET)
         report_expected = [
-            "時間戳記", "電子郵件地址", "稱謂", "報修者姓名", "班級地點",
-            "損壞設備", "損壞情形描述", "照片或影片", "案件編號"
+            "時間戳記",
+            "電子郵件地址",
+            "稱謂",
+            "報修者姓名",
+            "班級地點",
+            "損壞設備",
+            "損壞情形描述",
+            "照片或影片",
+            "案件編號",
         ]
-        report_data = pd.DataFrame(
-            report_sheet.get_all_records(expected_headers=report_expected)
-        )
+        report_data = pd.DataFrame(report_sheet.get_all_records(expected_headers=report_expected))
 
         # --- 維修紀錄 ---
         repair_sheet = spreadsheet.worksheet(REPAIR_SHEET)
         repair_expected = ["時間戳記", "案件編號", "處理進度", "維修說明", "維修照片及影片"]
-        repair_data = pd.DataFrame(
-            repair_sheet.get_all_records(expected_headers=repair_expected)
-        )
+        repair_data = pd.DataFrame(repair_sheet.get_all_records(expected_headers=repair_expected))
 
         # --- 密碼 ---
         password_sheet = spreadsheet.worksheet(PASSWORD_SHEET)
         raw_pwd = password_sheet.acell("A1").value
         correct_password = norm_pwd(raw_pwd)
 
-
-        # 空表保護（欄位用你實際的表頭）
         if report_data.empty:
             report_data = pd.DataFrame(columns=report_expected)
         if repair_data.empty:
@@ -111,31 +203,34 @@ def load_data():
         st.error(f"資料讀取失敗 (load_data)：{e}")
         st.stop()
 
-def build_merged_view(report_df: pd.DataFrame, repair_df: pd.DataFrame) -> pd.DataFrame:
-    # 欄位轉字串，避免 merge 失敗
-    for df in (report_df, repair_df):
-        if "案件編號" in df.columns:
-            df["案件編號"] = df["案件編號"].astype(str).str.strip()
 
-    # 報修：只留你要的欄位
+def build_merged_view(report_df: pd.DataFrame, repair_df: pd.DataFrame) -> pd.DataFrame:
+    # 內部用案件編號做關聯
     r = report_df.copy()
-    r["報修日期"] = pd.to_datetime(r["時間戳記"], errors="coerce").dt.strftime("%Y-%m-%d")
+    w = repair_df.copy()
+
+    if "案件編號" in r.columns:
+        r["案件編號"] = r["案件編號"].astype(str).str.strip()
+    if "案件編號" in w.columns:
+        w["案件編號"] = w["案件編號"].astype(str).str.strip()
+
+    # 報修日期：只取 YYYY-MM-DD
+    r["報修日期"] = r["時間戳記"].apply(to_ymd)
+
+    # 報修：你要顯示的欄位（案件編號內部保留，待會顯示表不顯示）
     r = r[["案件編號", "報修日期", "班級地點", "損壞設備", "損壞情形描述", "照片或影片"]]
 
-    # 維修：同一案件可能多筆 -> 取最新一筆
-    w = repair_df.copy()
+    # 維修：同案件多筆取最新（以時間戳記排序）
     w["_ts"] = pd.to_datetime(w["時間戳記"], errors="coerce")
     w = w.sort_values("_ts").groupby("案件編號", as_index=False).tail(1)
     w = w[["案件編號", "處理進度", "維修說明", "維修照片及影片"]]
 
-    # 合併
     merged = r.merge(w, on="案件編號", how="left")
     return merged
 
 
-
 def append_repair_record(record: dict) -> bool:
-    """將維修紀錄寫入 Google Sheets（依維修紀錄表的實際欄位順序）"""
+    """依維修紀錄表欄位順序寫入"""
     try:
         spreadsheet = gspread_client.open_by_url(SHEET_URL)
         sheet = spreadsheet.worksheet(REPAIR_SHEET)
@@ -150,33 +245,48 @@ def append_repair_record(record: dict) -> bool:
         return False
 
 
-
+# =========================
+# App
+# =========================
 def main():
-
     st.title("報修 / 維修系統")
 
     report_data, repair_data, correct_password = load_data()
 
-    # --- 簡單登入 ---
+    # --- 登入 ---
     with st.sidebar:
         st.subheader("管理登入")
-        pwd_in = st.text_input("密碼", type="password")
-        pwd_in = norm_pwd(pwd_in)
-    
-        # A1 空白 -> 不需要登入
+        pwd_in = norm_pwd(st.text_input("密碼", type="password"))
+
         if correct_password == "":
             authed = True
             st.info("密碼設定!A1 為空，目前不需要登入。")
         else:
             authed = (pwd_in == correct_password)
-    
-        # 診斷（不顯示密碼本身）
+
         st.caption(f"密碼長度：A1={len(correct_password)}、輸入={len(pwd_in)}")
 
-
     merged = build_merged_view(report_data, repair_data)
+
+    # 顯示用：不顯示案件編號
+    show_cols = [
+        "報修日期", "班級地點", "損壞設備", "損壞情形描述", "照片或影片",
+        "處理進度", "維修說明", "維修照片及影片"
+    ]
     st.subheader("案件總覽（報修 + 維修）")
-    st.dataframe(merged, use_container_width=True)
+    st.dataframe(merged[show_cols], use_container_width=True)
+
+    # 媒體預覽（可選，量大會慢；需要就保留，不需要可刪）
+    with st.expander("媒體預覽（照片/影片）", expanded=False):
+        for _, row in merged.iterrows():
+            title = f"{row.get('報修日期','')}｜{row.get('班級地點','')}｜{row.get('損壞設備','')}"
+            with st.expander(title, expanded=False):
+                st.write("報修照片/影片：")
+                for link in split_links(row.get("照片或影片", "")):
+                    st.write(link)
+                st.write("維修照片/影片：")
+                for link in split_links(row.get("維修照片及影片", "")):
+                    st.write(link)
 
     if not authed:
         st.warning("密碼錯誤，無法新增維修紀錄。")
@@ -185,29 +295,63 @@ def main():
     st.divider()
     st.subheader("新增維修紀錄")
 
-    # 若你報修資料有案件編號可選，優先用下拉
-    # 若你報修資料有案件編號可選，優先用下拉
-    case_list = []
-    if ("案件編號" in report_data.columns) and (not report_data.empty):
-        s = report_data["案件編號"].dropna()
-        if not s.empty:
-            case_list = s.astype(str).unique().tolist()
+    # 建立「不顯示案件編號」的選單，但實際 value 用案件編號
+    r = report_data.copy()
+    r["案件編號"] = r["案件編號"].astype(str).str.strip()
+    r["報修日期"] = r["時間戳記"].apply(to_ymd)
+    r["顯示"] = r["報修日期"].astype(str) + "｜" + r["班級地點"].astype(str) + "｜" + r["損壞設備"].astype(str)
+
+    options = r[["顯示", "案件編號"]].dropna().drop_duplicates()
+    if options.empty:
+        st.error("報修資料沒有可用的案件（缺少 案件編號 / 班級地點 / 損壞設備）。")
+        return
+
+    display_to_id = dict(zip(options["顯示"].tolist(), options["案件編號"].tolist()))
 
     col1, col2 = st.columns(2)
     with col1:
-        if case_list:
-            case_id = st.selectbox("案件編號", options=case_list)
-        else:
-            case_id = st.text_input("案件編號")
+        choice = st.selectbox("選擇報修案件（不顯示案件編號）", options=list(display_to_id.keys()))
+        case_id = display_to_id[choice]  # 內部使用
     with col2:
         progress = st.selectbox("處理進度", options=["已接單", "處理中", "待料", "已完成", "退回/無法處理"])
 
+    note = st.text_area("維修說明", height=120)
+
+    uploaded_files = st.file_uploader(
+        "上傳維修照片/影片（可多選）",
+        type=["jpg", "jpeg", "png", "gif", "mp4", "mov", "webm"],
+        accept_multiple_files=True
+    )
+
+    if st.button("送出維修紀錄", type="primary"):
+        if not case_id.strip():
+            st.error("案件選擇異常（案件編號空白）。")
+            return
+
+        links = []
+        if uploaded_files:
+            with st.spinner("上傳檔案到 Google Drive..."):
+                for f in uploaded_files:
+                    links.append(upload_to_drive(f))
+
+        record = {
+            "時間戳記": datetime.now().strftime("%Y-%m-%d"),  # 只存年月日
+            "案件編號": case_id.strip(),
+            "處理進度": progress.strip(),
+            "維修說明": note.strip(),
+            "維修照片及影片": ",".join(links),
+        }
+
+        ok = append_repair_record(record)
+        if ok:
+            st.success("已寫入維修紀錄。")
+            st.cache_data.clear()
+
+            # 可選：LINE 通知（不需要可刪）
+            line_notify(f"維修更新\n{choice}\n進度：{record['處理進度']}\n日期：{record['時間戳記']}")
+
+            st.rerun()
+
+
 if __name__ == "__main__":
     main()
-
-
-
-
-
-
-
