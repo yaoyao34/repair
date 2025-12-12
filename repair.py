@@ -55,12 +55,6 @@ def status_icon(s):
     return "🔧"
 
 def read_sheet_as_df(ws, expected_headers):
-    """
-    最穩讀法：
-    - 用 get_all_values() 讀原始表格
-    - 第一列可能有空白/重複表頭，不管它
-    - 只依 expected_headers 建 DataFrame（缺欄補空）
-    """
     values = ws.get_all_values()
     if not values:
         return pd.DataFrame(columns=expected_headers)
@@ -68,7 +62,6 @@ def read_sheet_as_df(ws, expected_headers):
     header = values[0]
     rows = values[1:]
 
-    # 建立：欄名 -> 第一次出現的 index（忽略重複/空白）
     idx_map = {}
     for i, h in enumerate(header):
         h2 = norm(h)
@@ -82,6 +75,12 @@ def read_sheet_as_df(ws, expected_headers):
             data[h].append(row[i] if (i is not None and i < len(row)) else "")
 
     return pd.DataFrame(data)
+
+def safe_key(s: str) -> str:
+    """把 key 轉成 streamlit 安全字元，避免奇怪符號造成碰撞"""
+    s = norm(s)
+    s = re.sub(r"[^0-9a-zA-Z\u4e00-\u9fff_-]+", "_", s)
+    return s[:80] if len(s) > 80 else s
 
 
 # ================= Secrets / GSpread =================
@@ -98,7 +97,7 @@ def gs_client():
 gc = gs_client()
 
 
-# ================= 讀資料（最穩） =================
+# ================= 讀資料 =================
 @st.cache_data(ttl=120)
 def load_data():
     sh = gc.open_by_url(SHEET_URL)
@@ -108,17 +107,16 @@ def load_data():
     pwd_ws = sh.worksheet("密碼設定")
 
     report_headers = ["時間戳記","班級地點","損壞設備","損壞情形描述","照片或影片","案件編號"]
-    repair_headers  = ["時間戳記","案件編號","處理進度","維修說明"]  # 不用維修照片
+    repair_headers  = ["時間戳記","案件編號","處理進度","維修說明"]
 
     report = read_sheet_as_df(report_ws, report_headers)
     repair  = read_sheet_as_df(repair_ws, repair_headers)
 
     correct_pwd = norm(pwd_ws.acell("A1").value)
-
     return report, repair, correct_pwd
 
 
-# ================= 寫回（更新最後一筆，沒有就新增） =================
+# ================= 寫回 =================
 def save_repair(case_id, status, note):
     sh = gc.open_by_url(SHEET_URL)
     ws = sh.worksheet("維修紀錄")
@@ -143,12 +141,11 @@ def save_repair(case_id, status, note):
     if None in (c_ts, c_case, c_stat, c_note):
         raise RuntimeError("維修紀錄表頭缺少必要欄位：時間戳記/案件編號/處理進度/維修說明")
 
-    # 找最後一筆（以列順序）
     last_row = None
     for r in range(1, len(values)):
         row = values[r]
         if c_case < len(row) and norm(row[c_case]) == case_id:
-            last_row = r + 1  # sheet row number
+            last_row = r + 1
 
     today = datetime.now().strftime("%Y-%m-%d")
 
@@ -165,13 +162,13 @@ def save_repair(case_id, status, note):
         ws.append_row(new_row, value_input_option="USER_ENTERED")
 
 
-# ================= 主程式：整合顯示表單 =================
+# ================= 主程式 =================
 def main():
     st.title("報修 / 維修整合系統（自製表單版）")
 
     report, repair, correct_pwd = load_data()
 
-    # ---- Sidebar：登入 + 搜尋 + 篩選 ----
+    # ---- Sidebar ----
     with st.sidebar:
         st.subheader("管理登入")
         pwd_in = st.text_input("密碼", type="password")
@@ -180,22 +177,23 @@ def main():
         st.divider()
         kw = st.text_input("搜尋關鍵字（地點/設備/描述/維修）", value="").strip()
 
-        # 進度篩選
         status_list = sorted(set(repair["處理進度"].fillna("").astype(str).tolist()))
         status_filter = st.multiselect("篩選處理進度", options=status_list, default=[])
 
-    # ---- 合併：維修取同案件最後一筆 ----
+    # ---- 報修資料去重：同案件編號只留最後一筆（避免 form key 重複） ----
     r = report.copy()
     r["案件編號"] = r["案件編號"].astype(str).str.strip()
+    r["_ts"] = pd.to_datetime(r["時間戳記"], errors="coerce")
+    r = r.sort_values("_ts").groupby("案件編號", as_index=False).tail(1).drop(columns=["_ts"])
     r["報修日期"] = r["時間戳記"].apply(to_ymd)
 
+    # ---- 維修資料：同案件編號只取最後一筆 ----
     w = repair.copy()
     w["案件編號"] = w["案件編號"].astype(str).str.strip()
-    # 以列順序最後一筆為最新（tail(1)）
-    w = w.groupby("案件編號", as_index=False).tail(1)
+    w["_ts"] = pd.to_datetime(w["時間戳記"], errors="coerce")
+    w = w.sort_values("_ts").groupby("案件編號", as_index=False).tail(1).drop(columns=["_ts"])
 
-    df = r.merge(w[["案件編號","處理進度","維修說明"]], on="案件編號", how="left")
-    df = df.fillna("")
+    df = r.merge(w[["案件編號","處理進度","維修說明"]], on="案件編號", how="left").fillna("")
     df["_sort_date"] = pd.to_datetime(df["報修日期"], errors="coerce")
     df = df.sort_values("_sort_date", ascending=False, na_position="last").drop(columns=["_sort_date"])
 
@@ -212,51 +210,54 @@ def main():
             return k in text
         df = df[df.apply(hit, axis=1)]
 
-    # ---- 篩選處理進度 ----
+    # ---- 篩選 ----
     if status_filter:
         df = df[df["處理進度"].astype(str).isin(status_filter)]
 
-    # ---- 顯示（每案一個 expander + 表單）----
     if df.empty:
         st.info("目前沒有符合條件的案件。")
         return
 
-    for _, row in df.iterrows():
-        icon = status_icon(row["處理進度"])
-        title = f'{row["報修日期"]}｜{row["班級地點"]}｜{row["損壞設備"]}｜{icon} {row["處理進度"]}'.strip()
+    # ---- 顯示 ----
+    for i, row in enumerate(df.to_dict("records")):
+        icon = status_icon(row.get("處理進度",""))
+        title = f'{row.get("報修日期","")}｜{row.get("班級地點","")}｜{row.get("損壞設備","")}｜{icon} {row.get("處理進度","")}'.strip()
+
+        case_id = norm(row.get("案件編號",""))
+        case_key = safe_key(case_id)
 
         with st.expander(title, expanded=False):
-            # 報修內容（唯讀）
-            st.markdown(f"**損壞情形**：{row['損壞情形描述']}")
+            st.markdown(f"**損壞情形**：{row.get('損壞情形描述','')}")
 
-            # 連結（照片/影片）
-            links = split_links(row["照片或影片"])
+            links = split_links(row.get("照片或影片",""))
             if links:
                 st.markdown("**照片 / 影片（點連結查看）**")
-                for i, url in enumerate(links, start=1):
-                    st.markdown(f"- [{media_label(url,i)}]({url})")
+                for j, url in enumerate(links, start=1):
+                    st.markdown(f"- [{media_label(url,j)}]({url})")
             else:
                 st.caption("（無照片/影片）")
 
             st.divider()
 
-            # 維修區（登入者可編輯）
             if not authed:
                 st.warning("未登入：僅可查看維修內容。")
-                st.markdown(f"**處理進度**：{row['處理進度']}")
-                st.markdown(f"**維修說明**：{row['維修說明']}")
+                st.markdown(f"**處理進度**：{row.get('處理進度','')}")
+                st.markdown(f"**維修說明**：{row.get('維修說明','')}")
                 continue
 
-            with st.form(f"repair_{row['案件編號']}"):
+            # 關鍵：form key 一定唯一（案件編號 + 迴圈序號 + hash）
+            form_key = f"repair_{case_key}_{i}_{abs(hash(case_id)) % 100000}"
+
+            with st.form(key=form_key):
                 status_options = ["", "已接單", "處理中", "待料", "送修", "已完成", "退回/無法處理"]
-                cur = str(row["處理進度"]).strip()
+                cur = norm(row.get("處理進度",""))
                 idx = status_options.index(cur) if cur in status_options else 0
 
-                new_status = st.selectbox("處理進度", status_options, index=idx)
-                new_note = st.text_area("維修說明", value=str(row["維修說明"]))
+                new_status = st.selectbox("處理進度", status_options, index=idx, key=f"st_{form_key}")
+                new_note = st.text_area("維修說明", value=norm(row.get("維修說明","")), key=f"nt_{form_key}")
 
                 if st.form_submit_button("儲存"):
-                    save_repair(str(row["案件編號"]).strip(), new_status, new_note)
+                    save_repair(case_id, new_status, new_note)
                     st.success("已儲存")
                     st.cache_data.clear()
                     st.rerun()
