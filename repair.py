@@ -99,6 +99,27 @@ def load_data():
         st.error(f"資料讀取失敗 (load_data)：{e}")
         st.stop()
 
+def build_merged_view(report_df: pd.DataFrame, repair_df: pd.DataFrame) -> pd.DataFrame:
+    # 欄位轉字串，避免 merge 失敗
+    for df in (report_df, repair_df):
+        if "案件編號" in df.columns:
+            df["案件編號"] = df["案件編號"].astype(str).str.strip()
+
+    # 報修：只留你要的欄位
+    r = report_df.copy()
+    r["報修日期"] = pd.to_datetime(r["時間戳記"], errors="coerce").dt.strftime("%Y-%m-%d")
+    r = r[["案件編號", "報修日期", "班級地點", "損壞設備", "損壞情形描述", "照片或影片"]]
+
+    # 維修：同一案件可能多筆 -> 取最新一筆
+    w = repair_df.copy()
+    w["_ts"] = pd.to_datetime(w["時間戳記"], errors="coerce")
+    w = w.sort_values("_ts").groupby("案件編號", as_index=False).tail(1)
+    w = w[["案件編號", "處理進度", "維修說明", "維修照片及影片"]]
+
+    # 合併
+    merged = r.merge(w, on="案件編號", how="left")
+    return merged
+
 
 
 def append_repair_record(record: dict) -> bool:
@@ -132,11 +153,9 @@ def main():
         if not correct_password:
             st.info("未設定密碼（密碼設定!A1 為空），目前不需要登入。")
 
-    st.subheader("報修資料")
-    st.dataframe(report_data, use_container_width=True)
-
-    st.subheader("維修紀錄")
-    st.dataframe(repair_data, use_container_width=True)
+    merged = build_merged_view(report_data, repair_data)
+    st.subheader("案件總覽（報修 + 維修）")
+    st.dataframe(merged, use_container_width=True)
 
     if not authed:
         st.warning("密碼錯誤，無法新增維修紀錄。")
@@ -164,6 +183,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
