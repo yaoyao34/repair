@@ -60,7 +60,6 @@ def safe_key(s):
     return s[:80]
 
 def now_ts_full():
-    # 完整時間戳記：YYYY-MM-DD HH:MM:SS
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
@@ -111,7 +110,6 @@ def load_data():
         ["時間戳記","班級地點","損壞設備","損壞情形描述","照片或影片","案件編號"]
     )
 
-    # 這裡保留維修時間戳記欄位，等下要顯示「最新更新時間」
     repair = read_sheet_as_df(
         sh.worksheet("維修紀錄"),
         ["時間戳記","案件編號","處理進度","維修說明"]
@@ -185,13 +183,14 @@ def main():
 
     w = repair.copy()
     w["案件編號"] = w["案件編號"].astype(str).str.strip()
-    # 維修時間戳記現在是完整時間，依時間排序後取最新
     w["_ts"] = pd.to_datetime(w["時間戳記"], errors="coerce")
     w = w.sort_values("_ts").groupby("案件編號", as_index=False).tail(1)
 
-    # 合併時把「最新維修更新時間」一起帶進來顯示
+    # 重要：避免欄位名稱混淆，把維修時間戳記改成「維修更新時間」
+    w = w.rename(columns={"時間戳記": "維修更新時間"})
+
     df = r.merge(
-        w[["案件編號","時間戳記","處理進度","維修說明"]],
+        w[["案件編號","維修更新時間","處理進度","維修說明"]],
         on="案件編號",
         how="left"
     ).fillna("")
@@ -217,7 +216,14 @@ def main():
     # ---- 顯示 ----
     for i, row in enumerate(page_df.to_dict("records")):
         icon = status_icon(row.get("處理進度",""))
-        title = f'{row.get("報修日期","")}｜{row.get("班級地點","")}｜{row.get("損壞設備","")}｜{icon} {row.get("處理進度","")}'.strip()
+        last_update = norm(row.get("維修更新時間",""))
+        # 報修系統上顯示完整維修編輯時間：放在標題上（最直觀）
+        update_tag = f"｜維修更新：{last_update}" if last_update else "｜維修更新：—"
+
+        title = (
+            f'{row.get("報修日期","")}｜{row.get("班級地點","")}｜{row.get("損壞設備","")}'
+            f'｜{icon} {row.get("處理進度","")}{update_tag}'
+        ).strip()
 
         case_id = norm(row.get("案件編號",""))
         form_key = f"f_{safe_key(case_id)}_{page}_{i}"
@@ -233,12 +239,11 @@ def main():
 
             st.divider()
 
-            # 顯示最新維修更新時間（完整）
-            last_update = norm(row.get("時間戳記",""))  # 這是維修紀錄的時間戳記（最新一筆）
+            # 報修系統內文也顯示完整維修編輯時間
             if last_update:
-                st.caption(f"最新維修更新時間：{last_update}")
+                st.caption(f"維修更新時間（完整）：{last_update}")
             else:
-                st.caption("最新維修更新時間：（尚無維修紀錄）")
+                st.caption("維修更新時間（完整）：（尚無維修紀錄）")
 
             if not authed:
                 st.markdown(f"**處理進度**：{row.get('處理進度','')}")
@@ -251,7 +256,6 @@ def main():
                 status = st.selectbox("處理進度", options, index=options.index(cur))
                 note = st.text_area("維修說明", row.get("維修說明",""))
 
-                # 顯示「這次儲存會寫入的時間」（預覽）
                 st.caption(f"本次儲存時間：{now_ts_full()}")
 
                 if st.form_submit_button("儲存"):
