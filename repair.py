@@ -23,8 +23,6 @@ REPAIR_SHEET = "維修紀錄"
 PASSWORD_SHEET = "密碼設定"
 
 # --- 2. 核心函式 ---
-
-
 @st.cache_resource(ttl=None) 
 def get_gspread_client():
     """使用服務帳號憑證連接 Google Sheets API"""
@@ -32,6 +30,7 @@ def get_gspread_client():
         base64_string = st.secrets["GCP_BASE64_CREDENTIALS"] 
         
         # ❗ 最終修正：強制移除字串中所有空格和換行符 ❗
+        # 這是解決 Base64 Padding 錯誤的最終程式碼手段
         clean_base64_string = base64_string.replace(' ', '').replace('\n', '').strip()
         
         # 2. Base64 解碼回原始 JSON 字串
@@ -108,4 +107,5 @@ def append_repair_record(record):
         return False
 
 # ... (主程式 main() 保持不變) ...
+
 
