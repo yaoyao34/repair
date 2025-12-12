@@ -23,25 +23,41 @@ PASSWORD_SHEET = "密碼設定"
 
 # --- 2. 核心函式 ---
 
+
 @st.cache_resource(ttl=None) 
 def get_gspread_client():
     """使用服務帳號憑證連接 Google Sheets API"""
     try:
-        # 從 secrets.toml 讀取 [gsheets] 區段
-        credentials_dict = dict(st.secrets["gsheets"])
+        # 1. 讀取儲存的 JSON 字串 (使用新的變數名稱)
+        # 注意：我們現在讀取的是 Secrets 中的 GCP_CREDENTIALS_JSON
+        credentials_json_string = st.secrets["GCP_CREDENTIALS_JSON"] 
         
-        # 建立 gspread 憑證物件
+        # 2. 將字串解析成 Python 字典 (JSON 物件)
+        credentials_dict = json.loads(credentials_json_string)
+        
+        # 3. 建立 gspread 憑證物件
         creds = Credentials.from_service_account_info(
-            credentials_dict,
+            credentials_dict,  # 傳入解析好的字典
             scopes=['https://www.googleapis.com/auth/spreadsheets']
         )
-        # 建立 gspread client
+        
+        # 4. 建立 gspread client
         client = gspread.authorize(creds)
         return client
+        
+    except json.JSONDecodeError as json_e:
+        st.error("Secrets 格式錯誤：GCP_CREDENTIALS_JSON 字串解析失敗，請檢查 JSON 格式是否正確。")
+        st.stop()
+    except KeyError:
+        st.error("Secrets 設定錯誤：請確認您的 Secrets 中有名為 'GCP_CREDENTIALS_JSON' 的鍵。")
+        st.stop()
     except Exception as e:
-        st.error(f"Gspread 連線失敗，請檢查 secrets.toml 中的 [gsheets] 憑證格式和內容是否正確。錯誤: {e}")
+        # 如果是憑證結構問題，錯誤會在這裡被捕獲
+        st.error(f"Gspread 連線失敗：請檢查 Secrets 中的 GCP 憑證是否正確。錯誤: {e}")
         st.stop()
 
+
+        
 # 初始化客戶端
 gspread_client = get_gspread_client()
 
