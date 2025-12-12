@@ -23,38 +23,58 @@ REPAIR_SHEET = "維修紀錄"
 PASSWORD_SHEET = "密碼設定"
 
 # --- 2. 核心函式 ---
-@st.cache_resource(ttl=None) 
+@st.cache_resource(ttl=None)
 def get_gspread_client():
-    """使用服務帳號憑證連接 Google Sheets API"""
+    """使用服務帳號憑證連接 Google Sheets API（Base64 / urlsafe Base64 皆可）"""
     try:
-        base64_string = st.secrets["GCP_BASE64_CREDENTIALS"] 
-        
-        # ❗ 最終修正：強制移除字串中所有空格和換行符 ❗
-        # 這是解決 Base64 Padding 錯誤的最終程式碼手段
-        clean_base64_string = base64_string.replace(' ', '').replace('\n', '').strip()
-        
-        # 2. Base64 解碼回原始 JSON 字串
-        decoded_bytes = base64.b64decode(clean_base64_string)
-        decoded_string = decoded_bytes.decode('utf-8')
-        
-        # 3. 將 JSON 字串解析成 Python 字典
+        raw = st.secrets["GCP_BASE64_CREDENTIALS"]
+
+        # 1) 轉成字串並做強力清理（移除空白、換行、tab、可能的引號）
+        s = str(raw).strip().strip('"').strip("'")
+        s = "".join(s.split())  # 移除所有空白字元（含 \n \r \t space）
+
+        # 有些人會在 secrets 裡放 "base64:xxxxx"
+        if s.lower().startswith("base64:"):
+            s = s.split(":", 1)[1].strip()
+
+        # 2) 自動補 Base64 padding（長度必須為 4 的倍數）
+        missing = (-len(s)) % 4
+        if missing:
+            s += "=" * missing
+
+        # 3) 先用 urlsafe 解（兼容 '-' '_'），不行再用標準解
+        try:
+            decoded_bytes = base64.urlsafe_b64decode(s.encode("utf-8"))
+        except Exception:
+            decoded_bytes = base64.b64decode(s.encode("utf-8"))
+
+        decoded_string = decoded_bytes.decode("utf-8")
+
+        # 4) JSON 解析
         credentials_dict = json.loads(decoded_string)
-        
-        # 4. 建立 gspread 憑證物件
+
+        # 5) 建立 gspread client
         creds = Credentials.from_service_account_info(
             credentials_dict,
-            scopes=['https://www.googleapis.com/auth/spreadsheets']
+            scopes=["https://www.googleapis.com/auth/spreadsheets"]
         )
-        
-        # 5. 建立 gspread client
-        client = gspread.authorize(creds)
-        return client
-        
+        return gspread.authorize(creds)
+
     except Exception as e:
-        # 捕獲 Base64 或 JSON 解析失敗
-        st.error(f"Gspread 連線失敗，憑證解析錯誤。錯誤: {e}")
+        # 重要：把可診斷資訊印出來（不會泄漏整串，只印尾端）
+        try:
+            st.error(
+                "Gspread 連線失敗，憑證解析錯誤。\n"
+                f"錯誤: {e}\n"
+                f"Base64 長度: {len(str(st.secrets.get('GCP_BASE64_CREDENTIALS', '')))}\n"
+                f"Base64 尾端(最後20字): {str(st.secrets.get('GCP_BASE64_CREDENTIALS',''))[-20:]}"
+            )
+        except Exception:
+            st.error(f"Gspread 連線失敗，憑證解析錯誤。錯誤: {e}")
         st.stop()
-        
+
+
+
 # 初始化客戶端
 gspread_client = get_gspread_client()
 
@@ -107,5 +127,6 @@ def append_repair_record(record):
         return False
 
 # ... (主程式 main() 保持不變) ...
+
 
 
