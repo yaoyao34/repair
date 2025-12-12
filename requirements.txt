@@ -1,4 +1,6 @@
 streamlit
 pandas
 requests
-streamlit-gsheets-connection
+gspread               # 替代 streamlit-gsheets-connection
+google-auth
+
