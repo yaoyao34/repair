@@ -29,11 +29,13 @@ PASSWORD_SHEET = "密碼設定"
 def get_gspread_client():
     """使用服務帳號憑證連接 Google Sheets API"""
     try:
-        # ❗ 修正：將鍵名更改為您在 Secrets 中設定的名稱 ❗
         base64_string = st.secrets["GCP_BASE64_CREDENTIALS"] 
         
+        # ❗ 最終修正：強制移除字串中所有空格和換行符 ❗
+        clean_base64_string = base64_string.replace(' ', '').replace('\n', '').strip()
+        
         # 2. Base64 解碼回原始 JSON 字串
-        decoded_bytes = base64.b64decode(base64_string)
+        decoded_bytes = base64.b64decode(clean_base64_string)
         decoded_string = decoded_bytes.decode('utf-8')
         
         # 3. 將 JSON 字串解析成 Python 字典
@@ -49,16 +51,10 @@ def get_gspread_client():
         client = gspread.authorize(creds)
         return client
         
-    except KeyError:
-        # 捕獲錯誤時，提示使用者檢查最新的 Base64 鍵名
-        st.error("Secrets 設定錯誤：請確認您的 Secrets 中有名為 'GCP_BASE64_CREDENTIALS' 的鍵。")
-        st.stop()
     except Exception as e:
         # 捕獲 Base64 或 JSON 解析失敗
         st.error(f"Gspread 連線失敗，憑證解析錯誤。錯誤: {e}")
         st.stop()
-
-
         
 # 初始化客戶端
 gspread_client = get_gspread_client()
@@ -112,3 +108,4 @@ def append_repair_record(record):
         return False
 
 # ... (主程式 main() 保持不變) ...
+
