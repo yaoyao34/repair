@@ -12,7 +12,7 @@ import base64
 # --- gspread / google auth ---
 import gspread
 from google.oauth2.service_account import Credentials
-st.write("BOOT OK")
+
 
 # --- 1. 全域變數與設定 ---
 LINE_ACCESS_TOKEN = st.secrets.get("LINE_ACCESS_TOKEN", "")
@@ -115,7 +115,7 @@ def append_repair_record(record: dict) -> bool:
 
 
 def main():
-    st.write("MAIN OK")
+
     st.title("報修 / 維修系統")
 
     report_data, repair_data, correct_password = load_data()
@@ -160,6 +160,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
