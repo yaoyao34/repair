@@ -1,7 +1,4 @@
 
-
-
-
 import streamlit as st
 import pandas as pd
 import requests
@@ -62,49 +59,55 @@ gspread_client = get_gspread_client()
 
 @st.cache_data(ttl=600)
 def load_data():
-    """使用 gspread 讀取資料"""
+    """使用 gspread 讀取資料（只抓指定欄位，避免空白表頭造成 duplicates）"""
     try:
         spreadsheet = gspread_client.open_by_url(SHEET_URL)
 
-        # 報修資料
+        # --- 報修資料 ---
         report_sheet = spreadsheet.worksheet(REPORT_SHEET)
-        report_data = pd.DataFrame(report_sheet.get_all_records())
+        report_expected = [
+            "時間戳記", "電子郵件地址", "稱謂", "報修者姓名", "班級地點",
+            "損壞設備", "損壞情形描述", "照片或影片", "案件編號"
+        ]
+        report_data = pd.DataFrame(
+            report_sheet.get_all_records(expected_headers=report_expected)
+        )
 
-        # 維修紀錄
+        # --- 維修紀錄 ---
         repair_sheet = spreadsheet.worksheet(REPAIR_SHEET)
-        repair_data = pd.DataFrame(repair_sheet.get_all_records())
+        repair_expected = ["時間戳記", "案件編號", "處理進度", "維修說明", "維修照片及影片"]
+        repair_data = pd.DataFrame(
+            repair_sheet.get_all_records(expected_headers=repair_expected)
+        )
 
-        # 密碼
+        # --- 密碼 ---
         password_sheet = spreadsheet.worksheet(PASSWORD_SHEET)
         correct_password = (password_sheet.acell("A1").value or "").strip()
 
-        # 空表保護
+        # 空表保護（欄位用你實際的表頭）
         if report_data.empty:
-            report_data = pd.DataFrame(columns=["案件編號", "地點", "損壞設備"])
+            report_data = pd.DataFrame(columns=report_expected)
         if repair_data.empty:
-            repair_data = pd.DataFrame(columns=["案件編號", "處理進度", "維修說明", "更新時間"])
+            repair_data = pd.DataFrame(columns=repair_expected)
 
         return report_data, repair_data, correct_password
 
     except gspread.exceptions.WorksheetNotFound:
-        st.error(
-            f"工作表找不到：請檢查工作表名稱是否正確："
-            f"'{REPORT_SHEET}', '{REPAIR_SHEET}', '{PASSWORD_SHEET}'"
-        )
+        st.error(f"工作表找不到：請檢查分頁名稱是否為 '{REPORT_SHEET}', '{REPAIR_SHEET}', '{PASSWORD_SHEET}'")
         st.stop()
     except Exception as e:
         st.error(f"資料讀取失敗 (load_data)：{e}")
         st.stop()
 
 
+
 def append_repair_record(record: dict) -> bool:
-    """將維修紀錄寫入 Google Sheets（依欄位順序寫入，避免 dict 順序錯位）"""
+    """將維修紀錄寫入 Google Sheets（依維修紀錄表的實際欄位順序）"""
     try:
         spreadsheet = gspread_client.open_by_url(SHEET_URL)
         sheet = spreadsheet.worksheet(REPAIR_SHEET)
 
-        # 建議固定欄位順序（你表格欄位若不同，請照你的表頭調整）
-        fields = ["案件編號", "處理進度", "維修說明", "更新時間"]
+        fields = ["時間戳記", "案件編號", "處理進度", "維修說明", "維修照片及影片"]
         row = [record.get(k, "") for k in fields]
 
         sheet.append_row(row, value_input_option="USER_ENTERED")
@@ -112,6 +115,7 @@ def append_repair_record(record: dict) -> bool:
     except Exception as e:
         st.error(f"寫入維修紀錄失敗 (Gspread)：{e}")
         return False
+
 
 
 def main():
@@ -160,6 +164,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
