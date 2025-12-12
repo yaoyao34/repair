@@ -12,7 +12,11 @@ from google.oauth2.service_account import Credentials
 # --- 1. 全域變數與設定 ---
 LINE_ACCESS_TOKEN = st.secrets.get("LINE_ACCESS_TOKEN", "")
 GROUP_ID = st.secrets.get("GROUP_ID", "")
-SHEET_URL = st.secrets["SHEET_URL"]
+SHEET_URL = st.secrets.get("SHEET_URL")
+if not SHEET_URL:
+    st.error("找不到 SHEET_URL：請確認 Streamlit secrets 內有設定 SHEET_URL。")
+    st.stop()
+
 
 # 工作表名稱
 REPORT_SHEET = "報修資料"
@@ -147,4 +151,5 @@ def main():
             case_id = st.text_input("案件編號")
     with col2:
         progress = st.selectbox("處理進度", options=["已接單", "處理中", "待料", "已完成", "退回/無法處理"])
+
 
