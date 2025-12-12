@@ -59,6 +59,10 @@ def safe_key(s):
     s = re.sub(r"[^0-9a-zA-Z\u4e00-\u9fff_-]+", "_", s)
     return s[:80]
 
+def now_ts_full():
+    # 完整時間戳記：YYYY-MM-DD HH:MM:SS
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
 
 # ================= GSpread =================
 SHEET_URL = st.secrets["SHEET_URL"]
@@ -107,6 +111,7 @@ def load_data():
         ["時間戳記","班級地點","損壞設備","損壞情形描述","照片或影片","案件編號"]
     )
 
+    # 這裡保留維修時間戳記欄位，等下要顯示「最新更新時間」
     repair = read_sheet_as_df(
         sh.worksheet("維修紀錄"),
         ["時間戳記","案件編號","處理進度","維修說明"]
@@ -116,7 +121,7 @@ def load_data():
     return report, repair, pwd
 
 
-# ================= 寫回 =================
+# ================= 寫回（完整時間戳記） =================
 def save_repair(case_id, status, note):
     ws = gc.open_by_url(SHEET_URL).worksheet("維修紀錄")
     values = ws.get_all_values()
@@ -129,20 +134,24 @@ def save_repair(case_id, status, note):
         return None
 
     c_ts, c_case, c_stat, c_note = map(col, ["時間戳記","案件編號","處理進度","維修說明"])
+    if None in (c_ts, c_case, c_stat, c_note):
+        raise RuntimeError("維修紀錄表頭缺少必要欄位：時間戳記/案件編號/處理進度/維修說明")
 
-    today = datetime.now().strftime("%Y-%m-%d")
+    ts = now_ts_full()
+
     last = None
     for i in range(1, len(values)):
-        if c_case < len(values[i]) and norm(values[i][c_case]) == case_id:
+        row = values[i]
+        if c_case < len(row) and norm(row[c_case]) == case_id:
             last = i + 1
 
     if last:
-        ws.update_cell(last, c_ts+1, today)
+        ws.update_cell(last, c_ts+1, ts)
         ws.update_cell(last, c_stat+1, status)
         ws.update_cell(last, c_note+1, note)
     else:
         row = [""] * len(header)
-        row[c_ts] = today
+        row[c_ts] = ts
         row[c_case] = case_id
         row[c_stat] = status
         row[c_note] = note
@@ -176,10 +185,17 @@ def main():
 
     w = repair.copy()
     w["案件編號"] = w["案件編號"].astype(str).str.strip()
+    # 維修時間戳記現在是完整時間，依時間排序後取最新
     w["_ts"] = pd.to_datetime(w["時間戳記"], errors="coerce")
     w = w.sort_values("_ts").groupby("案件編號", as_index=False).tail(1)
 
-    df = r.merge(w[["案件編號","處理進度","維修說明"]], on="案件編號", how="left").fillna("")
+    # 合併時把「最新維修更新時間」一起帶進來顯示
+    df = r.merge(
+        w[["案件編號","時間戳記","處理進度","維修說明"]],
+        on="案件編號",
+        how="left"
+    ).fillna("")
+
     df = df.sort_values("報修日期", ascending=False)
 
     if kw:
@@ -200,30 +216,44 @@ def main():
 
     # ---- 顯示 ----
     for i, row in enumerate(page_df.to_dict("records")):
-        icon = status_icon(row["處理進度"])
-        title = f'{row["報修日期"]}｜{row["班級地點"]}｜{row["損壞設備"]}｜{icon} {row["處理進度"]}'
+        icon = status_icon(row.get("處理進度",""))
+        title = f'{row.get("報修日期","")}｜{row.get("班級地點","")}｜{row.get("損壞設備","")}｜{icon} {row.get("處理進度","")}'.strip()
 
-        case_id = norm(row["案件編號"])
+        case_id = norm(row.get("案件編號",""))
         form_key = f"f_{safe_key(case_id)}_{page}_{i}"
 
         with st.expander(title):
-            st.markdown(f"**損壞情形**：{row['損壞情形描述']}")
+            st.markdown(f"**損壞情形**：{row.get('損壞情形描述','')}")
 
-            for j, url in enumerate(split_links(row["照片或影片"]), 1):
-                st.markdown(f"- [{media_label(url,j)}]({url})")
+            links = split_links(row.get("照片或影片",""))
+            if links:
+                st.markdown("**照片 / 影片（點連結查看）**")
+                for j, url in enumerate(links, 1):
+                    st.markdown(f"- [{media_label(url,j)}]({url})")
 
             st.divider()
 
+            # 顯示最新維修更新時間（完整）
+            last_update = norm(row.get("時間戳記",""))  # 這是維修紀錄的時間戳記（最新一筆）
+            if last_update:
+                st.caption(f"最新維修更新時間：{last_update}")
+            else:
+                st.caption("最新維修更新時間：（尚無維修紀錄）")
+
             if not authed:
-                st.markdown(f"**處理進度**：{row['處理進度']}")
-                st.markdown(f"**維修說明**：{row['維修說明']}")
+                st.markdown(f"**處理進度**：{row.get('處理進度','')}")
+                st.markdown(f"**維修說明**：{row.get('維修說明','')}")
                 continue
 
             with st.form(form_key):
                 options = ["","待觀查","處理中","待料","送修","已完成","退回/無法處理"]
-                cur = row["處理進度"] if row["處理進度"] in options else ""
+                cur = row.get("處理進度","") if row.get("處理進度","") in options else ""
                 status = st.selectbox("處理進度", options, index=options.index(cur))
-                note = st.text_area("維修說明", row["維修說明"])
+                note = st.text_area("維修說明", row.get("維修說明",""))
+
+                # 顯示「這次儲存會寫入的時間」（預覽）
+                st.caption(f"本次儲存時間：{now_ts_full()}")
+
                 if st.form_submit_button("儲存"):
                     save_repair(case_id, status, note)
                     st.success("已儲存")
