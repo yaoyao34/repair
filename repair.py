@@ -132,6 +132,19 @@ def main():
     st.subheader("新增維修紀錄")
 
     # 若你報修資料有案件編號可選，優先用下拉
+    # 若你報修資料有案件編號可選，優先用下拉
     case_list = []
-    if "案件編號" in report_data.columns and not report_data["案件編號"].isna().all():
-        case_list = [str(x) for x in report_data_]()_
+    if ("案件編號" in report_data.columns) and (not report_data.empty):
+        s = report_data["案件編號"].dropna()
+        if not s.empty:
+            case_list = s.astype(str).unique().tolist()
+
+    col1, col2 = st.columns(2)
+    with col1:
+        if case_list:
+            case_id = st.selectbox("案件編號", options=case_list)
+        else:
+            case_id = st.text_input("案件編號")
+    with col2:
+        progress = st.selectbox("處理進度", options=["已接單", "處理中", "待料", "已完成", "退回/無法處理"])
+
