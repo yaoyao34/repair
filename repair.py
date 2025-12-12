@@ -24,7 +24,7 @@ def to_ymd(ts) -> str:
     """
     強韌轉換成 YYYY-MM-DD
     - pandas 可解析就轉
-    - 解析不到：嘗試從字串抓 2025-12-12 / 2025/12/12 這類格式
+    - 解析不到：從字串抓 2025-12-12 / 2025/12/12
     """
     if ts is None:
         return ""
@@ -51,15 +51,25 @@ def split_links(cell: str) -> list[str]:
     return [p.strip() for p in str(cell).split(",") if p.strip()]
 
 
+def media_label(url: str, idx: int) -> str:
+    """
+    依連結判斷顯示為：照片 n / 影片 n / 檔案 n
+    Drive 連結常無副檔名，會回到「檔案 n」
+    """
+    u = (url or "").lower()
+    if any(u.endswith(ext) for ext in [".jpg", ".jpeg", ".png", ".gif", ".webp"]):
+        return f"照片 {idx}"
+    if any(u.endswith(ext) for ext in [".mp4", ".mov", ".webm", ".mkv"]):
+        return f"影片 {idx}"
+    return f"檔案 {idx}"
+
+
 def status_emoji(status: str) -> str:
-    """
-    狀態圖示（你提的邏輯 + 常用補強）
-    """
     s = (status or "").strip()
     e = "🔧"
     if "已完成" in s:
         e = "✅"
-    elif "送修" in s or "送" in s and "修" in s:
+    elif "送修" in s:
         e = "🚚"
     elif "待料" in s:
         e = "📦"
@@ -138,6 +148,7 @@ def load_data():
         report_data = pd.DataFrame(report_sheet.get_all_records(expected_headers=report_expected))
 
         repair_sheet = spreadsheet.worksheet(REPAIR_SHEET)
+        # 維修照片欄位存在也沒關係，此版不使用，但保留 expected_headers 以防表頭空白
         repair_expected = ["時間戳記", "案件編號", "處理進度", "維修說明", "維修照片及影片"]
         repair_data = pd.DataFrame(repair_sheet.get_all_records(expected_headers=repair_expected))
 
@@ -164,7 +175,8 @@ def build_merged_view(report_df: pd.DataFrame, repair_df: pd.DataFrame) -> pd.Da
     """
     以 案件編號 合併：
     - 報修日期：YYYY-MM-DD
-    - 維修：抓「該案件在維修紀錄工作表中最後出現的一列」（不靠時間戳記，避免空白/格式亂）
+    - 維修：抓「該案件在維修紀錄中最後出現的一列」為最新（不依賴時間戳記）
+    - 預設依報修日期遞減排序
     """
     r = report_df.copy()
     w = repair_df.copy()
@@ -190,10 +202,8 @@ def build_merged_view(report_df: pd.DataFrame, repair_df: pd.DataFrame) -> pd.Da
     merged["處理進度"] = merged["處理進度"].fillna("")
     merged["維修說明"] = merged["維修說明"].fillna("")
 
-    # 狀態圖示欄
     merged["狀態"] = merged["處理進度"].apply(lambda x: f"{status_emoji(x)} {x}".strip())
 
-    # 報修日期預設遞減排
     merged["_sort_date"] = pd.to_datetime(merged["報修日期"], errors="coerce")
     merged = merged.sort_values(["_sort_date"], ascending=False, na_position="last").drop(columns=["_sort_date"])
 
@@ -203,7 +213,7 @@ def build_merged_view(report_df: pd.DataFrame, repair_df: pd.DataFrame) -> pd.Da
 def update_latest_repair(case_id: str, progress: str, note: str) -> bool:
     """
     更新「維修紀錄」該案件最後一筆；若不存在則新增。
-    僅更新：時間戳記(YYYY-MM-DD)、處理進度、維修說明。
+    只寫：時間戳記(YYYY-MM-DD)、處理進度、維修說明。
     """
     try:
         spreadsheet = gspread_client.open_by_url(SHEET_URL)
@@ -279,11 +289,11 @@ def main():
         st.divider()
         st.subheader("搜尋 / 篩選")
 
-        keyword = st.text_input("關鍵字（可搜：地點/設備/描述/維修說明）", value="").strip()
+        keyword = st.text_input("關鍵字（地點/設備/描述/維修說明）", value="").strip()
 
-        all_status = sorted([s for s in merged["處理進度"].fillna("").unique().tolist()])
-        # 讓使用者好選：把空白放最後
-        all_status = [s for s in all_status if s != ""] + ([""] if "" in all_status else [])
+        # 進度篩選（可多選）
+        all_status = merged["處理進度"].fillna("").astype(str).unique().tolist()
+        all_status = sorted(set(all_status), key=lambda x: (x == "", x))
         status_filter = st.multiselect("篩選處理進度", options=all_status, default=[])
 
     # ---- Apply filters ----
@@ -291,6 +301,7 @@ def main():
 
     if keyword:
         k = keyword.lower()
+
         def hit(row) -> bool:
             fields = [
                 row.get("班級地點", ""),
@@ -304,26 +315,23 @@ def main():
         filtered = filtered[filtered.apply(hit, axis=1)]
 
     if status_filter:
-        filtered = filtered[filtered["處理進度"].fillna("").isin(status_filter)]
+        filtered = filtered[filtered["處理進度"].fillna("").astype(str).isin(status_filter)]
 
-    # ---- Table (editable) ----
-    st.subheader("案件總覽（上方可直接編修：處理進度 / 維修說明）")
+    # ---- Editable table ----
+    st.subheader("案件總覽（可直接編修：處理進度 / 維修說明）")
 
-    editor_df = filtered.copy()
-    # UI 不顯示案件編號，但內部要用它更新
-    editor_df = editor_df.set_index("案件編號")
+    # UI 不顯示案件編號，但內部必須用它更新
+    editor_df = filtered.copy().set_index("案件編號")
 
-    # 顯示欄位（照片欄保留原文字/連結）
-    view_cols = ["報修日期", "班級地點", "損壞設備", "損壞情形描述", "照片或影片", "狀態", "維修說明"]
+    # 重要：data_editor 不放「照片或影片」，避免篩選 rerun 時 schema crash
+    show_in_editor = editor_df[
+        ["報修日期", "班級地點", "損壞設備", "損壞情形描述", "處理進度", "狀態", "維修說明"]
+    ]
 
-    # 未登入：全部唯讀；登入：只允許改「處理進度」「維修說明」
-    disabled_cols = ["報修日期", "班級地點", "損壞設備", "損壞情形描述", "照片或影片", "狀態", "維修說明", "處理進度"]
     if authed:
-        disabled_cols = ["報修日期", "班級地點", "損壞設備", "損壞情形描述", "照片或影片", "狀態"]
-
-    # data_editor 內要包含「處理進度」才可編輯，但你也要顯示「狀態」
-    # 所以這裡同時帶入「處理進度」並在 column_config 做美化
-    show_in_editor = editor_df[["報修日期", "班級地點", "損壞設備", "損壞情形描述", "照片或影片", "處理進度", "狀態", "維修說明"]]
+        disabled_cols = ["報修日期", "班級地點", "損壞設備", "損壞情形描述", "狀態"]
+    else:
+        disabled_cols = ["報修日期", "班級地點", "損壞設備", "損壞情形描述", "處理進度", "狀態", "維修說明"]
 
     edited = st.data_editor(
         show_in_editor,
@@ -338,17 +346,17 @@ def main():
             "狀態": st.column_config.TextColumn("狀態"),
             "維修說明": st.column_config.TextColumn("維修說明"),
         },
-        key="editor",
+        # 關鍵：讓 data_editor key 跟著篩選結果變化，避免 schema 沿用導致不相容
+        key=f"editor_{hash((keyword, tuple(status_filter), len(filtered)))}",
     )
 
-    # ---- Report photo hyperlinks ----
+    # ---- Clickable links (photos/videos) ----
     st.divider()
     st.subheader("報修照片 / 影片（可點連結）")
 
     if filtered.empty:
         st.info("目前沒有符合條件的案件。")
     else:
-        # 用 expander 顯示每案的可點連結（逗號分隔）
         for _, row in filtered.iterrows():
             title = f"{row.get('報修日期','')}｜{row.get('班級地點','')}｜{row.get('損壞設備','')}"
             with st.expander(title, expanded=False):
@@ -356,9 +364,9 @@ def main():
                 if not links:
                     st.write("（無）")
                 else:
-                    # 逐一產生超連結
                     for i, url in enumerate(links, start=1):
-                        st.markdown(f"- [報修檔案 {i}]({url})")
+                        label = media_label(url, i)
+                        st.markdown(f"- [{label}]({url})")
 
     if not authed:
         st.warning("密碼錯誤：目前只能查看，無法儲存編修。")
@@ -367,16 +375,16 @@ def main():
     # ---- Save changes ----
     st.divider()
     if st.button("儲存變更", type="primary"):
-        # 對齊原始（filtered 的 editor_df）與 edited（data_editor 回傳）
-        original = editor_df[["處理進度", "維修說明"]].fillna("")
-        current = edited[["處理進度", "維修說明"]].fillna("")
+        # 重新用同一份 filtered 建 original（避免 key 變動造成狀態不一致）
+        original_df = filtered.copy().set_index("案件編號")[["處理進度", "維修說明"]].fillna("")
+        current_df = edited[["處理進度", "維修說明"]].fillna("")
 
         changed_cases = []
-        for case_id in current.index:
-            if case_id not in original.index:
+        for case_id in current_df.index:
+            if case_id not in original_df.index:
                 continue
-            if (str(current.loc[case_id, "處理進度"]) != str(original.loc[case_id, "處理進度"])) or \
-               (str(current.loc[case_id, "維修說明"]) != str(original.loc[case_id, "維修說明"])):
+            if (str(current_df.loc[case_id, "處理進度"]) != str(original_df.loc[case_id, "處理進度"])) or \
+               (str(current_df.loc[case_id, "維修說明"]) != str(original_df.loc[case_id, "維修說明"])):
                 changed_cases.append(case_id)
 
         if not changed_cases:
@@ -385,8 +393,8 @@ def main():
 
         ok_cnt = 0
         for case_id in changed_cases:
-            p = str(current.loc[case_id, "處理進度"]).strip()
-            n = str(current.loc[case_id, "維修說明"]).strip()
+            p = str(current_df.loc[case_id, "處理進度"]).strip()
+            n = str(current_df.loc[case_id, "維修說明"]).strip()
             if update_latest_repair(case_id=case_id, progress=p, note=n):
                 ok_cnt += 1
 
