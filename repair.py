@@ -272,7 +272,7 @@ def make_pdf_bytes(title: str, df_export: pd.DataFrame) -> bytes:
 
 # ================= 主程式 =================
 def main():
-    st.title("報修 / 維修整合系統")
+    st.title("秀水高工資訊設備報修")
 
     report, repair, correct_pwd = load_data()
 
@@ -425,4 +425,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
