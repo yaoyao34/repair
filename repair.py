@@ -68,8 +68,12 @@ def safe_key(s):
     s = re.sub(r"[^0-9a-zA-Z\u4e00-\u9fff_-]+", "_", s)
     return s[:80]
 
+from zoneinfo import ZoneInfo
+
+TZ = ZoneInfo("Asia/Taipei")
+
 def now_ts_full():
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    return datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
 
 
 # ================= GSpread =================
@@ -421,3 +425,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
