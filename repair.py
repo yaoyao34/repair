@@ -21,10 +21,55 @@ def norm_pwd(x) -> str:
 
 
 def to_ymd(ts) -> str:
-    d = pd.to_datetime(ts, errors="coerce")
-    if pd.isna(d):
+    """
+    強韌轉換成 YYYY-MM-DD
+    - pandas 可解析就轉
+    - 解析不到：嘗試從字串抓 2025-12-12 / 2025/12/12 這類格式
+    """
+    if ts is None:
         return ""
-    return d.strftime("%Y-%m-%d")
+    s = str(ts).strip()
+    if not s:
+        return ""
+
+    d = pd.to_datetime(s, errors="coerce")
+    if not pd.isna(d):
+        return d.strftime("%Y-%m-%d")
+
+    m = re.search(r"(\d{4})[/-](\d{1,2})[/-](\d{1,2})", s)
+    if m:
+        y, mo, da = m.group(1), int(m.group(2)), int(m.group(3))
+        return f"{y}-{mo:02d}-{da:02d}"
+
+    return ""
+
+
+def split_links(cell: str) -> list[str]:
+    """Google 表單多檔案用逗號分隔"""
+    if not cell:
+        return []
+    return [p.strip() for p in str(cell).split(",") if p.strip()]
+
+
+def status_emoji(status: str) -> str:
+    """
+    狀態圖示（你提的邏輯 + 常用補強）
+    """
+    s = (status or "").strip()
+    e = "🔧"
+    if "已完成" in s:
+        e = "✅"
+    elif "送修" in s or "送" in s and "修" in s:
+        e = "🚚"
+    elif "待料" in s:
+        e = "📦"
+    elif "處理中" in s:
+        e = "🛠️"
+    elif "退回" in s or "無法" in s:
+        e = "⛔"
+    elif "已接單" in s:
+        e = "🧾"
+    return e
 
 
 # =========================
@@ -74,10 +119,10 @@ gspread_client = get_gspread_client()
 
 @st.cache_data(ttl=600)
 def load_data():
+    """只抓指定欄位，避免空白表頭 duplicates"""
     try:
         spreadsheet = gspread_client.open_by_url(SHEET_URL)
 
-        # --- 報修資料 ---
         report_sheet = spreadsheet.worksheet(REPORT_SHEET)
         report_expected = [
             "時間戳記",
@@ -92,13 +137,10 @@ def load_data():
         ]
         report_data = pd.DataFrame(report_sheet.get_all_records(expected_headers=report_expected))
 
-        # --- 維修紀錄 ---
-        # 注意：工作表仍可能有「維修照片及影片」欄位，但此版不使用它
         repair_sheet = spreadsheet.worksheet(REPAIR_SHEET)
         repair_expected = ["時間戳記", "案件編號", "處理進度", "維修說明", "維修照片及影片"]
         repair_data = pd.DataFrame(repair_sheet.get_all_records(expected_headers=repair_expected))
 
-        # --- 密碼 ---
         password_sheet = spreadsheet.worksheet(PASSWORD_SHEET)
         raw_pwd = password_sheet.acell("A1").value
         correct_password = norm_pwd(raw_pwd)
@@ -119,23 +161,25 @@ def load_data():
 
 
 def build_merged_view(report_df: pd.DataFrame, repair_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    以 案件編號 合併：
+    - 報修日期：YYYY-MM-DD
+    - 維修：抓「該案件在維修紀錄工作表中最後出現的一列」（不靠時間戳記，避免空白/格式亂）
+    """
     r = report_df.copy()
     w = repair_df.copy()
 
-    if "案件編號" in r.columns:
-        r["案件編號"] = r["案件編號"].astype(str).str.strip()
-    if "案件編號" in w.columns:
-        w["案件編號"] = w["案件編號"].astype(str).str.strip()
+    r["案件編號"] = r["案件編號"].astype(str).str.strip()
+    w["案件編號"] = w["案件編號"].astype(str).str.strip()
 
-    # 報修日期：只取 YYYY-MM-DD
     r["報修日期"] = r["時間戳記"].apply(to_ymd)
     r = r[["案件編號", "報修日期", "班級地點", "損壞設備", "損壞情形描述", "照片或影片"]]
 
-    # 維修：同案件多筆取最新
-    w["_ts"] = pd.to_datetime(w["時間戳記"], errors="coerce")
-    w = w.sort_values("_ts").groupby("案件編號", as_index=False).tail(1)
+    # 維修取最新：以原資料列順序為準（最後出現者為最新）
+    w = w.reset_index(drop=True)
+    w["_row_order"] = w.index
+    w = w.sort_values("_row_order").groupby("案件編號", as_index=False).tail(1)
 
-    # 只保留你要編修的欄位（不含維修照片）
     if "處理進度" not in w.columns:
         w["處理進度"] = ""
     if "維修說明" not in w.columns:
@@ -145,27 +189,34 @@ def build_merged_view(report_df: pd.DataFrame, repair_df: pd.DataFrame) -> pd.Da
     merged = r.merge(w, on="案件編號", how="left")
     merged["處理進度"] = merged["處理進度"].fillna("")
     merged["維修說明"] = merged["維修說明"].fillna("")
+
+    # 狀態圖示欄
+    merged["狀態"] = merged["處理進度"].apply(lambda x: f"{status_emoji(x)} {x}".strip())
+
+    # 報修日期預設遞減排
+    merged["_sort_date"] = pd.to_datetime(merged["報修日期"], errors="coerce")
+    merged = merged.sort_values(["_sort_date"], ascending=False, na_position="last").drop(columns=["_sort_date"])
+
     return merged
 
 
 def update_latest_repair(case_id: str, progress: str, note: str) -> bool:
     """
-    更新「維修紀錄」中該案件的最新一筆（以最後出現的列為準）。
-    若該案件不存在任何維修紀錄，則新增一筆。
+    更新「維修紀錄」該案件最後一筆；若不存在則新增。
+    僅更新：時間戳記(YYYY-MM-DD)、處理進度、維修說明。
     """
     try:
         spreadsheet = gspread_client.open_by_url(SHEET_URL)
         ws = spreadsheet.worksheet(REPAIR_SHEET)
 
-        # 取整張表（第1列是表頭）
         values = ws.get_all_values()
-        if not values or len(values) < 1:
-            st.error("維修紀錄工作表是空的或讀取失敗。")
+        if not values:
+            st.error("維修紀錄工作表讀取失敗或空表。")
             return False
 
         header = values[0]
-        # 欄位索引
-        def col_idx(name: str):
+
+        def idx(name: str) -> int:
             return header.index(name)
 
         required = ["時間戳記", "案件編號", "處理進度", "維修說明"]
@@ -174,24 +225,22 @@ def update_latest_repair(case_id: str, progress: str, note: str) -> bool:
                 st.error(f"維修紀錄缺少欄位：{k}")
                 return False
 
-        idx_ts = col_idx("時間戳記")
-        idx_case = col_idx("案件編號")
-        idx_prog = col_idx("處理進度")
-        idx_note = col_idx("維修說明")
+        idx_ts = idx("時間戳記")
+        idx_case = idx("案件編號")
+        idx_prog = idx("處理進度")
+        idx_note = idx("維修說明")
 
-        # 找該案件最後一筆（資料列從第2列開始）
         last_row_number = None
         for i in range(1, len(values)):
             row = values[i]
             if len(row) <= idx_case:
                 continue
             if str(row[idx_case]).strip() == case_id:
-                last_row_number = i + 1  # 轉成 worksheet row number（1-based）
+                last_row_number = i + 1  # sheet row number (1-based)
 
         today = datetime.now().strftime("%Y-%m-%d")
 
         if last_row_number is None:
-            # 新增一筆（維修照片欄位若存在就留空）
             out = [""] * len(header)
             out[idx_ts] = today
             out[idx_case] = case_id
@@ -199,7 +248,6 @@ def update_latest_repair(case_id: str, progress: str, note: str) -> bool:
             out[idx_note] = note
             ws.append_row(out, value_input_option="USER_ENTERED")
         else:
-            # 更新最後一筆
             ws.update_cell(last_row_number, idx_ts + 1, today)
             ws.update_cell(last_row_number, idx_prog + 1, progress)
             ws.update_cell(last_row_number, idx_note + 1, note)
@@ -215,57 +263,113 @@ def main():
     st.title("報修 / 維修系統")
 
     report_data, repair_data, correct_password = load_data()
+    merged = build_merged_view(report_data, repair_data)
 
-    # --- 登入 ---
+    # ---- Sidebar: 登入 + 搜尋/篩選 ----
     with st.sidebar:
         st.subheader("管理登入")
         pwd_in = norm_pwd(st.text_input("密碼", type="password"))
-
         if correct_password == "":
             authed = True
             st.info("密碼設定!A1 為空，目前不需要登入。")
         else:
             authed = (pwd_in == correct_password)
-
         st.caption(f"密碼長度：A1={len(correct_password)}、輸入={len(pwd_in)}")
 
-    merged = build_merged_view(report_data, repair_data)
+        st.divider()
+        st.subheader("搜尋 / 篩選")
 
-    # 顯示/編修用：把案件編號放在 index（並隱藏 index），UI 不顯示案件編號
-    editor_df = merged.copy()
+        keyword = st.text_input("關鍵字（可搜：地點/設備/描述/維修說明）", value="").strip()
+
+        all_status = sorted([s for s in merged["處理進度"].fillna("").unique().tolist()])
+        # 讓使用者好選：把空白放最後
+        all_status = [s for s in all_status if s != ""] + ([""] if "" in all_status else [])
+        status_filter = st.multiselect("篩選處理進度", options=all_status, default=[])
+
+    # ---- Apply filters ----
+    filtered = merged.copy()
+
+    if keyword:
+        k = keyword.lower()
+        def hit(row) -> bool:
+            fields = [
+                row.get("班級地點", ""),
+                row.get("損壞設備", ""),
+                row.get("損壞情形描述", ""),
+                row.get("維修說明", ""),
+            ]
+            text = " ".join([str(x) for x in fields]).lower()
+            return k in text
+
+        filtered = filtered[filtered.apply(hit, axis=1)]
+
+    if status_filter:
+        filtered = filtered[filtered["處理進度"].fillna("").isin(status_filter)]
+
+    # ---- Table (editable) ----
+    st.subheader("案件總覽（上方可直接編修：處理進度 / 維修說明）")
+
+    editor_df = filtered.copy()
+    # UI 不顯示案件編號，但內部要用它更新
     editor_df = editor_df.set_index("案件編號")
-    st.subheader("案件總覽（可直接編修：處理進度 / 維修說明）")
+
+    # 顯示欄位（照片欄保留原文字/連結）
+    view_cols = ["報修日期", "班級地點", "損壞設備", "損壞情形描述", "照片或影片", "狀態", "維修說明"]
+
+    # 未登入：全部唯讀；登入：只允許改「處理進度」「維修說明」
+    disabled_cols = ["報修日期", "班級地點", "損壞設備", "損壞情形描述", "照片或影片", "狀態", "維修說明", "處理進度"]
+    if authed:
+        disabled_cols = ["報修日期", "班級地點", "損壞設備", "損壞情形描述", "照片或影片", "狀態"]
+
+    # data_editor 內要包含「處理進度」才可編輯，但你也要顯示「狀態」
+    # 所以這裡同時帶入「處理進度」並在 column_config 做美化
+    show_in_editor = editor_df[["報修日期", "班級地點", "損壞設備", "損壞情形描述", "照片或影片", "處理進度", "狀態", "維修說明"]]
 
     edited = st.data_editor(
-        editor_df[["報修日期", "班級地點", "損壞設備", "損壞情形描述", "照片或影片", "處理進度", "維修說明"]],
+        show_in_editor,
         hide_index=True,
         use_container_width=True,
-        disabled=["報修日期", "班級地點", "損壞設備", "損壞情形描述", "照片或影片"] if not authed else
-                 ["報修日期", "班級地點", "損壞設備", "損壞情形描述", "照片或影片"],
+        disabled=disabled_cols,
         column_config={
             "處理進度": st.column_config.SelectboxColumn(
                 "處理進度",
-                options=["", "已接單", "處理中", "待料", "已完成", "退回/無法處理"],
+                options=["", "已接單", "處理中", "待料", "送修", "已完成", "退回/無法處理"],
             ),
+            "狀態": st.column_config.TextColumn("狀態"),
             "維修說明": st.column_config.TextColumn("維修說明"),
         },
         key="editor",
     )
 
+    # ---- Report photo hyperlinks ----
+    st.divider()
+    st.subheader("報修照片 / 影片（可點連結）")
+
+    if filtered.empty:
+        st.info("目前沒有符合條件的案件。")
+    else:
+        # 用 expander 顯示每案的可點連結（逗號分隔）
+        for _, row in filtered.iterrows():
+            title = f"{row.get('報修日期','')}｜{row.get('班級地點','')}｜{row.get('損壞設備','')}"
+            with st.expander(title, expanded=False):
+                links = split_links(row.get("照片或影片", ""))
+                if not links:
+                    st.write("（無）")
+                else:
+                    # 逐一產生超連結
+                    for i, url in enumerate(links, start=1):
+                        st.markdown(f"- [報修檔案 {i}]({url})")
+
     if not authed:
         st.warning("密碼錯誤：目前只能查看，無法儲存編修。")
         return
 
+    # ---- Save changes ----
     st.divider()
-
-    # 儲存：比對原始 merged 與 edited，找出變更
     if st.button("儲存變更", type="primary"):
-        original = editor_df[["處理進度", "維修說明"]].copy()
-        current = edited[["處理進度", "維修說明"]].copy()
-
-        # 以 index（案件編號）對齊
-        original = original.fillna("")
-        current = current.fillna("")
+        # 對齊原始（filtered 的 editor_df）與 edited（data_editor 回傳）
+        original = editor_df[["處理進度", "維修說明"]].fillna("")
+        current = edited[["處理進度", "維修說明"]].fillna("")
 
         changed_cases = []
         for case_id in current.index:
@@ -289,7 +393,7 @@ def main():
         st.success(f"已儲存 {ok_cnt} 筆變更。")
         st.cache_data.clear()
 
-        # 可選：LINE 通知（只通知有變更的筆數，不含案件編號）
+        # 可選：LINE 通知（不含案件編號）
         line_notify(f"維修更新：已儲存 {ok_cnt} 筆（{datetime.now().strftime('%Y-%m-%d')}）")
 
         st.rerun()
