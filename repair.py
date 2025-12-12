@@ -5,11 +5,21 @@ import requests
 from datetime import datetime
 import time
 import base64
+import re
 
 # --- gspread / google auth ---
 import gspread
 from google.oauth2.service_account import Credentials
 
+def norm_pwd(x) -> str:
+    """密碼正規化：去除全/半形空白、換行、零寬字元"""
+    if x is None:
+        return ""
+    s = str(x)
+    s = s.replace("\u3000", " ")          # 全形空白
+    s = re.sub(r"[\u200b-\u200d\ufeff]", "", s)  # 零寬字元
+    s = s.strip()
+    return s
 
 # --- 1. 全域變數與設定 ---
 LINE_ACCESS_TOKEN = st.secrets.get("LINE_ACCESS_TOKEN", "")
@@ -82,7 +92,9 @@ def load_data():
 
         # --- 密碼 ---
         password_sheet = spreadsheet.worksheet(PASSWORD_SHEET)
-        correct_password = (password_sheet.acell("A1").value or "").strip()
+        raw_pwd = password_sheet.acell("A1").value
+        correct_password = norm_pwd(raw_pwd)
+
 
         # 空表保護（欄位用你實際的表頭）
         if report_data.empty:
@@ -148,10 +160,19 @@ def main():
     # --- 簡單登入 ---
     with st.sidebar:
         st.subheader("管理登入")
-        pwd = st.text_input("密碼", type="password")
-        authed = (pwd == correct_password) if correct_password else True
-        if not correct_password:
-            st.info("未設定密碼（密碼設定!A1 為空），目前不需要登入。")
+        pwd_in = st.text_input("密碼", type="password")
+        pwd_in = norm_pwd(pwd_in)
+    
+        # A1 空白 -> 不需要登入
+        if correct_password == "":
+            authed = True
+            st.info("密碼設定!A1 為空，目前不需要登入。")
+        else:
+            authed = (pwd_in == correct_password)
+    
+        # 診斷（不顯示密碼本身）
+        st.caption(f"密碼長度：A1={len(correct_password)}、輸入={len(pwd_in)}")
+
 
     merged = build_merged_view(report_data, repair_data)
     st.subheader("案件總覽（報修 + 維修）")
@@ -183,6 +204,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
