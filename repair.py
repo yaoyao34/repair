@@ -55,14 +55,20 @@ def to_ymd(ts):
     return ""
 
 def fmt_24h(ts: str) -> str:
-    """任何報修時間字串 -> 24小時制 YYYY-MM-DD HH:MM:SS；轉不了就回原字串"""
+    """
+    例：2025/12/12 下午 10:01:49  ->  2025/12/12 22:01:49
+    轉不了就回傳原字串
+    """
     s = norm(ts)
     if not s:
         return ""
+
     d = pd.to_datetime(s, errors="coerce")
     if pd.isna(d):
         return s
-    return d.strftime("%Y-%m-%d %H:%M:%S")
+
+    return d.strftime("%Y/%m/%d %H:%M:%S")
+
 
 def split_links(cell):
     if not cell:
@@ -481,3 +487,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
