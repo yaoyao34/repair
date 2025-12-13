@@ -56,18 +56,37 @@ def to_ymd(ts):
 
 def fmt_24h(ts: str) -> str:
     """
-    例：2025/12/12 下午 10:01:49  ->  2025/12/12 22:01:49
-    轉不了就回傳原字串
+    例：2025/12/12 下午 10:01:49 或 2025/12/12 下午\n10:01:49
+    -> 2025-12-12 22:01:49
+    轉不了就回傳原字串（但會先把換行壓成空白）
     """
-    s = norm(ts)
+    s = norm(ts).replace("\n", " ").replace("\r", " ")
+    s = re.sub(r"\s+", " ", s).strip()
     if not s:
         return ""
 
-    d = pd.to_datetime(s, errors="coerce")
-    if pd.isna(d):
-        return s
+    # 嘗試抓：YYYY/MM/DD + (上午|下午)? + HH:MM:SS
+    m = re.search(r"(\d{4})[/-](\d{1,2})[/-](\d{1,2})\s*(上午|下午)?\s*(\d{1,2}):(\d{2}):(\d{2})", s)
+    if m:
+        y, mo, da = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        ap = m.group(4) or ""
+        hh, mm, ss = int(m.group(5)), int(m.group(6)), int(m.group(7))
 
-    return d.strftime("%Y/%m/%d %H:%M:%S")
+        # 上午/下午轉 24 小時
+        if ap == "下午" and hh < 12:
+            hh += 12
+        if ap == "上午" and hh == 12:
+            hh = 0
+
+        return f"{y:04d}-{mo:02d}-{da:02d} {hh:02d}:{mm:02d}:{ss:02d}"
+
+    # 退而求其次：一般時間格式
+    d = pd.to_datetime(s, errors="coerce")
+    if not pd.isna(d):
+        return d.strftime("%Y-%m-%d %H:%M:%S")
+
+    return s
+
 
 
 def split_links(cell):
@@ -257,21 +276,25 @@ def make_pdf_bytes(title: str, df_export: pd.DataFrame) -> bytes:
     headers = ["報修時間", "班級地點", "損壞設備", "完工時間", "處理進度", "維修說明"]
     data = [[Paragraph(h, styleN) for h in headers]]
 
-    def P(x):
+    def P(x, keep_newline=True):
         s = norm(x).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-        s = s.replace("\n", "<br/>")
+        if keep_newline:
+            s = s.replace("\n", "<br/>")
+        else:
+            s = s.replace("\n", " ").replace("\r", " ")
+            s = re.sub(r"\s+", " ", s).strip()
         return Paragraph(s, styleN)
+
 
     for _, r in df_export.iterrows():
         data.append([
-            P(r.get("報修時間", "")),
+            P(r.get("報修時間", ""), keep_newline=False),
             P(r.get("班級地點", "")),
             P(r.get("損壞設備", "")),
-            P(r.get("完工時間", "")),
+            P(r.get("完工時間", ""), keep_newline=False),
             P(r.get("處理進度", "")),
             P(r.get("維修說明", "")),
         ])
-
     col_widths = [85, 85, 85, 85, 60, 165]
     table = Table(data, colWidths=col_widths, repeatRows=1)
     table.setStyle(TableStyle([
@@ -487,4 +510,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
