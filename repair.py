@@ -3,15 +3,28 @@ import pandas as pd
 from datetime import datetime, date
 from zoneinfo import ZoneInfo
 import re
+import io
 import gspread
 from google.oauth2.service_account import Credentials
 
-# ====== 基本設定 ======
-st.set_page_config(page_title="報修 / 維修整合系統", page_icon="🛠️", layout="wide")
+# ===== 基本設定 =====
+st.set_page_config(page_title="秀水高工資訊設備報修", page_icon="🛠️", layout="wide")
 
 REPAIR_FORM_URL = "https://docs.google.com/forms/d/e/1FAIpQLSf3uHqIqLqJyIDHCp1ZyQyP0edOGbNDKNSisHHpt0LtoBPs8w/viewform?usp=header"
 TZ = ZoneInfo("Asia/Taipei")
 PAGE_SIZE = 10
+
+# ===== PDF (可選) =====
+REPORTLAB_OK = True
+try:
+    from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib import colors
+    from reportlab.lib.styles import getSampleStyleSheet
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.cidfonts import UnicodeCIDFont
+except Exception:
+    REPORTLAB_OK = False
 
 
 # ================= 工具 =================
@@ -21,7 +34,6 @@ def norm(x):
     return str(x).strip()
 
 def now_ts_full():
-    # 台灣時間（含秒）
     return datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
 
 def to_ymd(ts):
@@ -109,7 +121,6 @@ def read_sheet_as_df(ws, headers):
 
     return pd.DataFrame(data)
 
-
 @st.cache_data(ttl=120)
 def load_data():
     sh = gc.open_by_url(SHEET_URL)
@@ -167,29 +178,110 @@ def save_repair(case_id, status, note):
         ws.append_row(row, value_input_option="USER_ENTERED")
 
 
-# ================= UI 小元件 =================
-def kpi_cards(df_all: pd.DataFrame):
-    total = len(df_all)
-    done = (df_all["處理進度"].astype(str).str.contains("已完成", na=False)).sum()
-    inprog = (df_all["處理進度"].astype(str).str.contains("處理中", na=False)).sum()
-    watch = (df_all["處理進度"].astype(str).str.contains("待觀查", na=False)).sum()
-    pending = (df_all["處理進度"].astype(str).str.contains("待料|送修", regex=True, na=False)).sum()
+# ================= PDF 匯出（登入後） =================
+def build_export_df(df_all: pd.DataFrame) -> pd.DataFrame:
+    out = pd.DataFrame()
+    out["報修時間"] = df_all["報修時間"].astype(str)
+    out["班級地點"] = df_all["班級地點"].astype(str)
+    out["損壞設備"] = df_all["損壞設備"].astype(str)
 
-    c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("全部案件", total)
-    c2.metric("已完成", done)
-    c3.metric("處理中", inprog)
-    c4.metric("待觀查", watch)
-    c5.metric("待料/送修", pending)
+    def done_time(row):
+        s = str(row.get("處理進度", ""))
+        if "已完成" in s:
+            return str(row.get("維修更新時間", ""))
+        return ""
+
+    out["完工時間"] = df_all.apply(done_time, axis=1)
+    out["處理進度"] = df_all["處理進度"].astype(str)
+    out["維修說明"] = df_all["維修說明"].astype(str)
+    return out.fillna("")
+
+def make_pdf_bytes(title: str, df_export: pd.DataFrame) -> bytes:
+    pdfmetrics.registerFont(UnicodeCIDFont("STSong-Light"))
+    font = "STSong-Light"
+
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buf, pagesize=A4,
+        leftMargin=24, rightMargin=24, topMargin=24, bottomMargin=24,
+        title=title
+    )
+
+    styles = getSampleStyleSheet()
+    styleN = styles["Normal"]
+    styleN.fontName = font
+    styleN.fontSize = 9
+    styleH = styles["Heading2"]
+    styleH.fontName = font
+
+    elements = []
+    elements.append(Paragraph(title, styleH))
+    elements.append(Spacer(1, 8))
+    elements.append(Paragraph(f"匯出時間：{now_ts_full()}", styleN))
+    elements.append(Spacer(1, 10))
+
+    headers = ["報修時間", "班級地點", "損壞設備", "完工時間", "處理進度", "維修說明"]
+    data = [headers]
+
+    def cut(s, n):
+        s = str(s or "")
+        return s if len(s) <= n else (s[: n - 1] + "…")
+
+    for _, r in df_export.iterrows():
+        data.append([
+            cut(r["報修時間"], 19),
+            cut(r["班級地點"], 20),
+            cut(r["損壞設備"], 20),
+            cut(r["完工時間"], 19),
+            cut(r["處理進度"], 10),
+            cut(r["維修說明"], 80),
+        ])
+
+    col_widths = [80, 80, 80, 80, 60, 170]
+    table = Table(data, colWidths=col_widths, repeatRows=1)
+    table.setStyle(TableStyle([
+        ("FONTNAME", (0, 0), (-1, -1), font),
+        ("FONTSIZE", (0, 0), (-1, -1), 8.5),
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#F0F0F0")),
+        ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#FAFAFA")]),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+        ("TOPPADDING", (0, 0), (-1, -1), 4),
+    ]))
+
+    elements.append(table)
+    doc.build(elements)
+    return buf.getvalue()
 
 
 # ================= 主程式 =================
 def main():
-    st.markdown("## 報修 / 維修整合系統")
-
     report, repair, correct_pwd = load_data()
 
-    # ---- 合併（先不做篩選，方便 KPI 正確）----
+    # ==== Sidebar：登入 + 查詢/篩選 + 匯出 ====
+    with st.sidebar:
+        st.title("管理 / 查詢")
+
+        st.subheader("管理登入")
+        pwd = st.text_input("密碼", type="password", placeholder="輸入密碼")
+        authed = (correct_pwd == "") or (pwd == correct_pwd)
+        st.caption("登入後可編修維修進度與匯出 PDF。")
+
+        st.divider()
+        st.subheader("查詢 / 篩選")
+        keyword = st.text_input("關鍵字", placeholder="地點 / 設備 / 描述 / 維修")
+
+        # 先合併出 df_all 才能拿到完整 status_list
+        # (先暫存 keyword/status_filter, 後面套用)
+        status_filter = st.multiselect("處理進度", options=[])
+
+        st.divider()
+        st.subheader("匯出維修紀錄")
+        # 匯出 UI 先放著，等 df_all 出來再補內容（下面會更新）
+
+
+    # ==== 合併資料 ====
     r = report.copy()
     r["案件編號"] = r["案件編號"].astype(str).str.strip()
     r["_ts"] = pd.to_datetime(r["時間戳記"], errors="coerce")
@@ -208,66 +300,87 @@ def main():
         on="案件編號",
         how="left"
     ).fillna("")
-
     df_all = df_all.sort_values("報修日期", ascending=False)
 
-    # ===== 置頂操作區：報修按鈕（免登入）+ 登入 =====
-    top1, top2 = st.columns([2, 1])
-    with top1:
+    # ==== Sidebar 需要 df_all 才能補上狀態選單與匯出 ====
+    with st.sidebar:
+        # 重新渲染處理進度 multiselect（用同一個 key 保持狀態）
+        status_list = sorted(set(df_all["處理進度"].fillna("").astype(str).tolist()))
+        st.session_state.setdefault("status_filter", [])
+        status_filter = st.multiselect("處理進度", status_list, default=st.session_state["status_filter"], key="status_filter")
+
+        st.divider()
+        st.subheader("匯出維修紀錄（PDF）")
+
+        all_dates = pd.to_datetime(df_all["報修日期"], errors="coerce")
+        min_d = all_dates.min().date() if pd.notna(all_dates.min()) else date.today()
+        max_d = all_dates.max().date() if pd.notna(all_dates.max()) else date.today()
+
+        start_d = st.date_input("報修日期起", value=min_d)
+        end_d = st.date_input("報修日期迄", value=max_d)
+
+        if not authed:
+            st.warning("需登入後才能匯出。")
+        else:
+            if start_d > end_d:
+                st.error("日期範圍錯誤：起始日期不可大於結束日期。")
+            else:
+                # 匯出資料以日期範圍為準（不受畫面搜尋/篩選影響）
+                dcol = pd.to_datetime(df_all["報修日期"], errors="coerce").dt.date
+                df_range = df_all[(dcol >= start_d) & (dcol <= end_d)].copy()
+                exp_df = build_export_df(df_range)
+
+                if REPORTLAB_OK:
+                    if st.button("產生 PDF", type="primary"):
+                        title = f"維修紀錄（{start_d.strftime('%Y-%m-%d')} ～ {end_d.strftime('%Y-%m-%d')}）"
+                        pdf_bytes = make_pdf_bytes(title, exp_df)
+                        filename = f"維修紀錄_{start_d.strftime('%Y%m%d')}-{end_d.strftime('%Y%m%d')}.pdf"
+                        st.download_button("下載 PDF", data=pdf_bytes, file_name=filename, mime="application/pdf")
+                else:
+                    st.error("目前環境未安裝 reportlab，無法產生 PDF。")
+                    st.caption("解法：requirements.txt 加上 reportlab，重新部署即可。")
+                    # 仍提供 CSV 當備援
+                    csv_bytes = exp_df.to_csv(index=False).encode("utf-8-sig")
+                    st.download_button("下載 CSV（備援）", data=csv_bytes, file_name="維修紀錄.csv", mime="text/csv")
+
+
+    # ==== 頁首：標題 + 右側報修按鈕（免登入） ====
+    left, right = st.columns([8, 1])
+    with left:
+        st.title("秀水高工資訊設備報修")
+    with right:
         st.markdown(
             f"""
-            <div style="padding:12px 14px;border:1px solid #e6e6e6;border-radius:12px;background:#fafafa;">
-              <div style="font-size:16px;font-weight:700;margin-bottom:6px;">快速報修</div>
-              <div style="font-size:13px;color:#444;margin-bottom:10px;">
-                不需要登入，直接填 Google 表單報修（可上傳多張照片/影片）。
-              </div>
+            <div style="display:flex;justify-content:flex-end;align-items:center;height:64px;">
               <a href="{REPAIR_FORM_URL}" target="_blank"
                  style="display:inline-block;padding:10px 14px;border-radius:10px;
-                        background:#1f77b4;color:white;text-decoration:none;font-weight:700;">
-                開啟報修表單
+                        border:1px solid rgba(127,127,127,.35);
+                        text-decoration:none;font-weight:700;">
+                報修
               </a>
             </div>
             """,
             unsafe_allow_html=True,
         )
 
-    with top2:
-        st.markdown(
-            """
-            <div style="padding:12px 14px;border:1px solid #e6e6e6;border-radius:12px;background:#ffffff;">
-              <div style="font-size:16px;font-weight:700;margin-bottom:6px;">管理登入</div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-        pwd = st.text_input("密碼", type="password", label_visibility="collapsed", placeholder="輸入密碼")
-        authed = (correct_pwd == "") or (pwd == correct_pwd)
-        st.caption("登入後可編修維修進度與匯出。")
+    # ==== KPI（不硬改背景，深色模式自然可讀） ====
+    total = len(df_all)
+    done = (df_all["處理進度"].astype(str).str.contains("已完成", na=False)).sum()
+    inprog = (df_all["處理進度"].astype(str).str.contains("處理中", na=False)).sum()
+    watch = (df_all["處理進度"].astype(str).str.contains("待觀查", na=False)).sum()
+    pending = (df_all["處理進度"].astype(str).str.contains("待料|送修", regex=True, na=False)).sum()
+
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("全部案件", total)
+    c2.metric("已完成", done)
+    c3.metric("處理中", inprog)
+    c4.metric("待觀查", watch)
+    c5.metric("待料/送修", pending)
 
     st.divider()
 
-    # ===== KPI =====
-    kpi_cards(df_all)
-
-    st.divider()
-
-    # ---- Sidebar：搜尋/篩選（更清楚）----
-    with st.sidebar:
-        st.subheader("查詢 / 篩選")
-        keyword = st.text_input("關鍵字", placeholder="例如：電腦教室 / 投影機 / 無法開機")
-        status_list = sorted(set(df_all["處理進度"].fillna("").astype(str).tolist()))
-        status_filter = st.multiselect("處理進度", status_list, default=[])
-
-        st.divider()
-        st.subheader("匯出")
-        if not authed:
-            st.caption("需登入後才可匯出（之後可再加 PDF）。")
-        else:
-            st.caption("登入狀態：可匯出（目前先保留介面位置）")
-
-    # ---- 套用搜尋/篩選 ----
+    # ==== 畫面用搜尋/篩選 ====
     df = df_all.copy()
-
     if keyword:
         k = keyword.lower()
         def hit(row):
@@ -285,22 +398,23 @@ def main():
     if status_filter:
         df = df[df["處理進度"].astype(str).isin(status_filter)]
 
-    # ---- 分頁：固定 10 筆 ----
-    total = len(df)
-    pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
+    # ==== 分頁（10 筆）====
+    total_show = len(df)
+    pages = max(1, (total_show + PAGE_SIZE - 1) // PAGE_SIZE)
     page = st.number_input("頁碼", 1, pages, 1)
 
     start = (page - 1) * PAGE_SIZE
     end = start + PAGE_SIZE
     page_df = df.iloc[start:end]
 
-    st.caption(f"共 {total} 筆，顯示第 {start+1}–{min(end, total)} 筆（第 {page}/{pages} 頁）")
+    st.caption(f"共 {total_show} 筆，顯示第 {start+1}–{min(end, total_show)} 筆（第 {page}/{pages} 頁）")
 
-    # ---- 列表 ----
+    # ==== 列表 ====
     for i, row in enumerate(page_df.to_dict("records")):
         icon = status_icon(row.get("處理進度", ""))
         last_update = norm(row.get("維修更新時間", ""))
         update_tag = f"｜維修更新：{last_update}" if last_update else "｜維修更新：—"
+
         title = (
             f'{row.get("報修日期","")}｜{row.get("班級地點","")}｜{row.get("損壞設備","")}'
             f'｜{icon} {row.get("處理進度","")}{update_tag}'
@@ -310,11 +424,9 @@ def main():
         form_key = f"f_{safe_key(case_id)}_{page}_{i}"
 
         with st.expander(title, expanded=False):
-            # 報修資訊
             st.markdown(f"**報修時間**：{row.get('報修時間','')}")
             st.markdown(f"**損壞情形**：{row.get('損壞情形描述','')}")
 
-            # 報修照片/影片連結
             links = split_links(row.get("照片或影片", ""))
             if links:
                 st.markdown("**照片 / 影片（點連結查看）**")
@@ -323,18 +435,16 @@ def main():
 
             st.divider()
 
-            # 維修資訊（顯示完整時間）
             if last_update:
                 st.caption(f"維修更新時間（完整）：{last_update}")
             else:
                 st.caption("維修更新時間（完整）：（尚無維修紀錄）")
 
-            if not authed:
+            if not ((correct_pwd == "") or (pwd == correct_pwd)):
                 st.markdown(f"**處理進度**：{row.get('處理進度','')}")
                 st.markdown(f"**維修說明**：{row.get('維修說明','')}")
                 continue
 
-            # 登入後可編修
             with st.form(form_key):
                 options = ["", "待觀查", "處理中", "待料", "送修", "已完成", "退回/無法處理"]
                 cur = row.get("處理進度", "") if row.get("處理進度", "") in options else ""
